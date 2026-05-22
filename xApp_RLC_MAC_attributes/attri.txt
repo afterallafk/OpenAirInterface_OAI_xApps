@@ -1,0 +1,23 @@
+============================================================
+🔍 MAC INDICATION STRUCTURE
+============================================================
+Top-level Attributes:
+  ['tstamp', 'ue_stats']
+
+UE Stats (ue_stats[0]) Attributes:
+  ['bsr', 'dl_aggr_bytes_sdus', 'dl_aggr_prb', 'dl_aggr_retx_prb', 'dl_aggr_sdus', 'dl_aggr_tbs', 'dl_bler', 'dl_curr_tbs', 'dl_harq', 'dl_mcs1', 'dl_mcs2', 'dl_num_harq', 'dl_sched_rb', 'frame', 'phr', 'pucch_snr', 'pusch_snr', 'rnti', 'slot', 'ul_aggr_bytes_sdus', 'ul_aggr_prb', 'ul_aggr_retx_prb', 'ul_aggr_sdus', 'ul_aggr_tbs', 'ul_bler', 'ul_curr_tbs', 'ul_harq', 'ul_mcs1', 'ul_mcs2', 'ul_num_harq', 'ul_sched_rb', 'wb_cqi']
+
+
+============================================================
+🔍 RLC INDICATION STRUCTURE
+============================================================
+Top-level Attributes:
+  ['rb_stats', 'tstamp']
+
+Radio Bearer Stats (rb_stats[0]) Attributes:
+  ['mode', 'rbid', 'rnti', 'rxbuf_occ_bytes', 'rxbuf_occ_pkts', 'rxpdu_bytes', 'rxpdu_dd_bytes', 'rxpdu_dd_pkts', 'rxpdu_dup_bytes', 'rxpdu_dup_pkts', 'rxpdu_ow_bytes', 'rxpdu_ow_pkts', 'rxpdu_pkts', 'rxpdu_status_bytes', 'rxpdu_status_pkts', 'rxsdu_bytes', 'rxsdu_dd_bytes', 'rxsdu_dd_pkts', 'rxsdu_pkts', 'txbuf_occ_bytes', 'txbuf_occ_pkts', 'txpdu_bytes', 'txpdu_dd_bytes', 'txpdu_dd_pkts', 'txpdu_pkts', 'txpdu_retx_bytes', 'txpdu_retx_pkts', 'txpdu_segmented', 'txpdu_status_bytes', 'txpdu_status_pkts', 'txpdu_wt_ms', 'txsdu_avg_time_to_tx', 'txsdu_bytes', 'txsdu_pkts', 'txsdu_wt_us']
+
+
+============================================================
+✅ Inspection complete!
+============================================================
