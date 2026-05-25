@@ -6,7 +6,7 @@ get_ip() {
     ip -4 addr show "$1" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}'
 }
 
-# 9 UE setup tracking (4 URLLC, 3 eMBB, 2 mMTC)
+# 10 UE setup tracking (6 URLLC, 2 eMBB, 2 mMTC)
 IP_URLLC_1=$(get_ip "oaitun_ue_1")
 IP_EMBB_1=$(get_ip  "oaitun_ue_2")
 IP_MMTC_1=$(get_ip  "oaitun_ue_3")
@@ -14,29 +14,28 @@ IP_URLLC_2=$(get_ip "oaitun_ue_4")
 IP_EMBB_2=$(get_ip  "oaitun_ue_5")
 IP_MMTC_2=$(get_ip  "oaitun_ue_6")
 IP_URLLC_3=$(get_ip "oaitun_ue_7")
-IP_EMBB_3=$(get_ip  "oaitun_ue_8")
-IP_URLLC_4=$(get_ip "oaitun_ue_9")
-IP_URLLC_5=$(get_ip "oaitun_ue_10")
+IP_URLLC_4=$(get_ip "oaitun_ue_8")
+IP_URLLC_5=$(get_ip "oaitun_ue_9")  # NEW
+IP_URLLC_6=$(get_ip "oaitun_ue_10") # NEW
 
 # Validate detection
-if [ -z "$IP_URLLC_5" ]; then
-    echo "[ERROR] Could not detect all 9 UEs. Ensure oaitun_ue_1 through oaitun_ue_9 are active."
+if [ -z "$IP_URLLC_6" ]; then
+    echo "[ERROR] Could not detect all 10 UEs. Ensure oaitun_ue_1 through oaitun_ue_10 are active."
     exit 1
 fi
 
 echo "------------------------------------------------"
-echo "  UE1 (URLLC_1) : $IP_URLLC_1"
-echo "  UE2 (eMBB_1)  : $IP_EMBB_1"
-echo "  UE3 (mMTC_1)  : $IP_MMTC_1"
-echo "  UE4 (URLLC_2) : $IP_URLLC_2"
-echo "  UE5 (eMBB_2)  : $IP_EMBB_2"
-echo "  UE6 (mMTC_2)  : $IP_MMTC_2"
-echo "  UE7 (URLLC_3) : $IP_URLLC_3"
-echo "  UE8 (eMBB_3)  : $IP_EMBB_3"
-echo "  UE9 (URLLC_4) : $IP_URLLC_4"
-echo "  UE10 (URLLC_5) : $IP_URLLC_5"
+echo "  UE1  (URLLC_1) : $IP_URLLC_1"
+echo "  UE2  (eMBB_1)  : $IP_EMBB_1"
+echo "  UE3  (mMTC_1)  : $IP_MMTC_1"
+echo "  UE4  (URLLC_2) : $IP_URLLC_2"
+echo "  UE5  (eMBB_2)  : $IP_EMBB_2"
+echo "  UE6  (mMTC_2)  : $IP_MMTC_2"
+echo "  UE7  (URLLC_3) : $IP_URLLC_3"
+echo "  UE8  (URLLC_4) : $IP_URLLC_4"
+echo "  UE9  (URLLC_5) : $IP_URLLC_5"
+echo "  UE10 (URLLC_6) : $IP_URLLC_6"
 echo "------------------------------------------------"
-
 # ====================================================================
 # AUTO-INSTALL PYTHON IN CONTAINER IF MISSING
 # ====================================================================
@@ -157,17 +156,17 @@ EOF
 
 echo "Injecting MATLAB-aligned Burst models into OAI network..."
 
-# 4 URLLC UEs
+# 6 URLLC UEs (Updated)
 docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_URLLC_1 URLLC
 docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_URLLC_2 URLLC
 docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_URLLC_3 URLLC
 docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_URLLC_4 URLLC
-docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_URLLC_5 URLLC
+docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_URLLC_5 URLLC # NEW
+docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_URLLC_6 URLLC # NEW
 
-# 3 eMBB UEs
+# 2 eMBB UEs
 docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_EMBB_1 eMBB
 docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_EMBB_2 eMBB
-docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_EMBB_3 eMBB
 
 # 2 mMTC UEs
 docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_MMTC_1 mMTC
@@ -176,7 +175,7 @@ docker exec -d oai-ext-dn python3 /tmp/traffic_gen.py $IP_MMTC_2 mMTC
 echo "Traffic flowing to all 10 UEs! Press Ctrl+C to stop."
 
 # Automatically kill the background traffic generators when you stop this script
-trap 'echo -e "\nStopping traffic..."; docker exec oai-ext-dn pkill -f traffic_gen.py; exit 0' INT
+trap 'echo -e "\nStopping traffic..."; docker exec oai-ext-dn pkill -f traffic_gen.py 2>/dev/null; exit 0' INT TERM EXIT
 
 while true; do
     sleep 1
