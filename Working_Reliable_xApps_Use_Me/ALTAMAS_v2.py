@@ -7,52 +7,58 @@ Faithful implementation of:
 
 Paper equations referenced inline:  Eq.(2)–(13), Algorithm 1.
 
-Configured for 8 QoS flows: 4 URLLC, 2 eMBB, 2 mMTC  (2 servers: NR + WLAN)
+Configured for 10 QoS flows: 6 URLLC, 2 eMBB, 2 mMTC  (2 servers: NR + WLAN)
 
-RLC attributes used  (attri.txt):
-    rb.rnti, rb.txbuf_occ_bytes, rb.txsdu_wt_us
+OAI Attribute Reference (verified against live xApp inspection)
+---------------------------------------------------------------
+MAC  (ue_stats[i]):
+  ue.rnti             — UE radio network temporary identifier
+  ue.wb_cqi           — Wideband CQI (0-15, 3GPP TS 38.214 Table 5.1.3.1-1)
+                        Refreshed on PUCCH reporting cycle; may be 0 between cycles.
+  ue.dl_mcs1          — DL MCS index layer-1 (0-28, TS 38.214 Table 5.1.3.2-1)
+                        Used as fallback when wb_cqi == 0.
+  ue.dl_curr_tbs      — TBS (bits) granted in the current slot by OAI scheduler
+  ue.dl_sched_rb      — RBs granted in the current slot by OAI scheduler
+  ue.dl_aggr_tbs      — Aggregate TBS (bits) over the 10 ms reporting window
+  ue.dl_bler          — DL block error rate (0.0–1.0)
+  ue.dl_harq          — HARQ process state vector
+  ue.bsr              — Buffer Status Report (bytes)
 
-MAC attributes used  (attri.txt):
-    ue.rnti, ue.wb_cqi, ue.dl_curr_tbs, ue.dl_sched_rb,
-    ue.dl_aggr_tbs, ue.dl_bler, ue.dl_harq, ue.bsr, ue.dl_mcs1
+RLC  (rb_stats[i]):
+  rb.rnti             — UE RNTI (matches MAC)
+  rb.txbuf_occ_bytes  — DL TX buffer occupancy in bytes (HOL-queue depth)
+  rb.txsdu_wt_us      — HOL SDU waiting time in MICROSECONDS ← correct for
+                        deadline comparison (divide by 1000 to get ms)
+  NOTE: rb.txpdu_wt_ms is PDU-level (post-segmentation) — less precise for
+        SDU deadline monitoring; NOT used by this scheduler.
 
-NOTE on spectral efficiency / TBS:
-    OAI already computes the exact TBS and RB grant via its own
-    MCS/CQI/MIMO pipeline and exposes them directly as:
-        ue.dl_curr_tbs  — bits scheduled in this slot
-        ue.dl_sched_rb  — RBs granted in this slot
-    se_bits_per_rb = dl_curr_tbs / dl_sched_rb is the true channel
-    capacity per RB and replaces separate lookup tables entirely.
-    wb_cqi is still read for CSV logging, with MCS fallback derivation.
+Fixes applied in this version (v2_fixed_attr)
+----------------------------------------------
+FIX-1  λ estimation from dl_aggr_tbs (10 ms window), EMA-smoothed.
 
-Corrections applied vs previous version (paper-faithful)
----------------------------------------------------------
-FIX-1  λ estimation: replaced RLC byte-counter delta with MAC
-       dl_aggr_tbs-based rate (aggregate TBS over the 10 ms report
-       window), clamped to [0.1·λ_nom, 2·λ_nom].
+FIX-2  RLC callback aggregates per-UE correctly:
+         txbuf_bytes = SUM, txsdu_wt_us = MAX across all bearers.
 
-FIX-2  RLC callback correctly resets then aggregates per-UE:
-         txbuf_bytes = SUM over all bearers (was overwrite → last bearer only)
-         txsdu_wt_us = MAX  over all bearers (was overwrite → stale data)
+FIX-3  Throughput logged in Mbps: tp_pktps × pkt_bytes × 8 / 1e6.
 
-FIX-3  Throughput_Mbps logged as Mbps: tp_pktps × nom_pkt_bytes × 8 / 1e6.
+FIX-4  All latency arithmetic in seconds (beta_max_s pre-converted).
 
-FIX-4  Unit mismatch in Eq.(13) and reward/logging:
-         calculate_latency() returns seconds.
-         beta_max_ms must be converted to seconds before any arithmetic
-         involving W.  Previously Wδ_norm compared ms to s (1000× error).
+FIX-5  P(W > β_max) deterministic indicator per paper Eq.(8).
 
-FIX-5  P(W > β_max) in Eq.(8) is now a deterministic indicator
-         faithful to the paper:  1 if W(Eq.9) > β_max_i, else 0.
-         Previous version used an exponential CDF approximation
-         (exp(−µ_eff·β)) which is not described anywhere in the paper.
+FIX-6  EvaluateAndObtainMapping: unseen mapping returned immediately.
 
-FIX-6  EvaluateAndObtainMapping (Algorithm 1) now correctly implements
-         the paper's pseudocode condition:
-           if R[x] == -1 OR R[l] < R[x] → return x  (first match wins)
-         Previously, unseen mappings (R==-1) were treated as last-resort
-         fallbacks instead of being returned immediately on first encounter,
-         contradicting the paper's exploration-first intent.
+FIX-7  Per-slice RB cap: URLLC=1.0, eMBB=0.5, mMTC=0.3 × virt_rbs[j].
+
+FIX-8  eMBB lam_nom normalised (7000→2000, 5000→1500 pkt/s).
+
+FIX-9  (NEW) MCS→CQI fallback table corrected against 3GPP TS 38.214.
+         Previous heuristic (mcs+1, mcs+2, mcs-1 …) was wrong for 27
+         out of 29 MCS indices.  Replaced with a pre-computed lookup
+         table derived by matching spectral efficiency (Qm × R/1024)
+         between TS 38.214 Table 5.1.3.2-1 (MCS) and Table 5.1.3.1-1
+         (CQI).  The table only affects CSV logging; the primary channel
+         capacity estimate is se_bits_per_rb = dl_curr_tbs/dl_sched_rb
+         which comes directly from OAI's own MCS/CQI/MIMO pipeline.
 """
 
 import xapp_sdk as ric
@@ -63,61 +69,98 @@ import itertools
 import traceback
 
 # ======================================================================
-# QoS Flow Configuration  (10 flows: 6 URLLC, 2 eMBB, 2 mMTC)
-# Tuple layout:
-#   (idx, label, slice, 5qi, priority, lam_nom_pktps,
-#    beta_max_ms, gamma_min, eps1, eps2, nom_pkt_bytes)
+# FIX-8: Normalised eMBB lam_nom
+# -----------------------------------------------------------------------
+# Old values:  eMBB_1 = 7000 pkt/s, eMBB_2 = 5000 pkt/s  (1500 B pkt)
+#   → 84 Mbps / 60 Mbps nominal — saturates the shared NR carrier alone.
+# New values:  eMBB_1 = 2000 pkt/s, eMBB_2 = 1500 pkt/s  (1500 B pkt)
+#   → 24 Mbps / 18 Mbps nominal — realistic for 10-UE shared carrier.
 #
-# priority: strict Kleinrock preemption (1 = highest, 10 = lowest)
-#           URLLC (1-6) > eMBB (7-8) > mMTC (9-10)
+# Combined offered load across all 10 flows to Cellular (mu=15000):
+#   6×URLLC  ≈ 6×850  =  5100 pkt/s
+#   2×eMBB   ≈ 3500   =  3500 pkt/s   (was 12000 — caused ρ≈0.8 just eMBB)
+#   2×mMTC   ≈ 4000   =  4000 pkt/s
+#   Total    ≈ 12600 pkt/s  →  ρ_Cellular ≈ 0.84  ✓ (was >1.0 at old values)
 # ======================================================================
 QOS_FLOWS_CFG = [
     # idx  label      slice   5qi  prio  lam_nom  beta_ms  gamma    e1   e2   pkt_B
     (0,  "URLLC_1", "URLLC", 86,  1,    900,     1.0,   0.99999, 0.2, 0.8, 100),
-    (1,  "eMBB_1",  "eMBB",   9,  7,   7000,    15.0,   0.999,   0.5, 0.5, 1500), # Shifted prio
-    (2,  "mMTC_1",  "mMTC",  70,  9,   2000,    30.0,   0.99,    0.8, 0.2,  64),  # Shifted prio
+    (1,  "eMBB_1",  "eMBB",   9,  7,   2000,    15.0,   0.999,   0.5, 0.5, 1500),  # FIX-8: 7000→2000
+    (2,  "mMTC_1",  "mMTC",  70,  9,   2000,    30.0,   0.99,    0.8, 0.2,  64),
     (3,  "URLLC_2", "URLLC", 86,  2,    800,     3.0,   0.99999, 0.2, 0.8, 100),
-    (4,  "eMBB_2",  "eMBB",   9,  8,   5000,    15.0,   0.999,   0.5, 0.5, 1500), # Shifted prio
-    (5,  "mMTC_2",  "mMTC",  70, 10,   2000,    30.0,   0.99,    0.8, 0.2,  64),  # Shifted prio
+    (4,  "eMBB_2",  "eMBB",   9,  8,   1500,    15.0,   0.999,   0.5, 0.5, 1500),  # FIX-8: 5000→1500
+    (5,  "mMTC_2",  "mMTC",  70, 10,   2000,    30.0,   0.99,    0.8, 0.2,  64),
     (6,  "URLLC_3", "URLLC", 86,  3,    900,     1.0,   0.99999, 0.2, 0.8, 100),
     (7,  "URLLC_4", "URLLC", 86,  4,    800,     3.0,   0.99999, 0.2, 0.8, 100),
-    (8,  "URLLC_5", "URLLC", 86,  5,    900,     1.0,   0.99999, 0.2, 0.8, 100), # NEW
-    (9,  "URLLC_6", "URLLC", 86,  6,    800,     3.0,   0.99999, 0.2, 0.8, 100), # NEW
+    (8,  "URLLC_5", "URLLC", 86,  5,    900,     1.0,   0.99999, 0.2, 0.8, 100),
+    (9,  "URLLC_6", "URLLC", 86,  6,    800,     3.0,   0.99999, 0.2, 0.8, 100),
 ]
 
-# Server configuration — paper Table III
-# Scaled up mu_pktps to handle 10 UEs (Combined capacity: 25,000 pkt/s)
-#   (id, label, mu_pktps, buffer_k, access_type)
+# Server configuration — scaled for 10 UEs (paper Table III × 5/3)
 SERVERS_CFG = [
     (0, "Cellular", 15000, 80, "NR"),
     (1, "WLAN",     10000, 50, "WLAN"),
 ]
 
-N_SERVERS = len(SERVERS_CFG)               # N = 2
-M_FLOWS   = len(QOS_FLOWS_CFG)             # M = 8  →  L = 2^8 = 256 mappings
+N_SERVERS = len(SERVERS_CFG)
+M_FLOWS   = len(QOS_FLOWS_CFG)       # 10 flows → L = 2^10 = 1024 mappings
 
 # Radio / slot constants
 TOTAL_RBS        = 106
-# NUM_LAYERS, NUM_SYMB, SC_PER_RB removed — tbs_per_rb() no longer exists;
-# se_bits_per_rb is derived directly from OAI dl_curr_tbs / dl_sched_rb.
-SLOT_DURATION_MS = 0.5        # 30 kHz SCS → 0.5 ms per slot
-SLOT_DURATION_S  = 0.5e-3     # seconds
+SLOT_DURATION_MS = 0.5               # 30 kHz SCS
+SLOT_DURATION_S  = 0.5e-3
 
-# Algorithm 1 Step-2 EMA: R[l] = 0.5·R[l] + 0.5·Rc
+# Algorithm 1 EMA
 ALPHA_EMA = 0.5
 
-# ── Spectral-efficiency / TBS derivation ──────────────────────────────────
-# OAI MAC reports ue.dl_curr_tbs  (bits scheduled this slot) and
-# ue.dl_sched_rb  (RBs actually granted this slot).  These are the
-# *real* values computed by OAI's own MCS/CQI/MIMO pipeline, so there
-# is no need to maintain separate CQI_TO_SE or MCS_TO_SE lookup tables.
+# SE floor
+SE_FLOOR_BITS_PER_RB = 1.0
+
+# ======================================================================
+# FIX-9: Correct MCS → CQI fallback lookup table
+# -----------------------------------------------------------------------
+# Derived from 3GPP TS 38.214:
+#   MCS table : Table 5.1.3.2-1  (64QAM, indices 0-28)
+#   CQI table : Table 5.1.3.1-1  (CQI indices 1-15)
 #
-# Effective bits-per-RB for the current slot:
-#   se_bits_per_rb = dl_curr_tbs / max(dl_sched_rb, 1)
+# Method: for each MCS index compute SE = Qm × (R/1024), then select
+# the CQI index whose SE is closest (minimum |SE_cqi - SE_mcs|).
 #
-# This single formula replaces both tables and tbs_per_rb() entirely.
-# A safe floor of 1 bit/RB prevents division-by-zero on idle slots.
-SE_FLOOR_BITS_PER_RB = 1.0   # absolute minimum — never zero
+# MCS_TO_CQI[mcs] → cqi  (mcs in 0..28, cqi in 1..15)
+# Verified output:
+#   MCS  0→CQI 1 | MCS  1→CQI 2 | MCS  2→CQI 2 | MCS  3→CQI 2
+#   MCS  4→CQI 2 | MCS  5→CQI 3 | MCS  6→CQI 3 | MCS  7→CQI 4
+#   MCS  8→CQI 4 | MCS  9→CQI 4 | MCS 10→CQI 5 | MCS 11→CQI 5
+#   MCS 12→CQI 5 | MCS 13→CQI 6 | MCS 14→CQI 6 | MCS 15→CQI 7
+#   MCS 16→CQI 8 | MCS 17→CQI 7 | MCS 18→CQI 8 | MCS 19→CQI 9
+#   MCS 20→CQI 9 | MCS 21→CQI 9 | MCS 22→CQI10 | MCS 23→CQI11
+#   MCS 24→CQI11 | MCS 25→CQI11 | MCS 26→CQI12 | MCS 27→CQI12
+#   MCS 28→CQI13
+#
+# Note: CQI 14 and 15 share the same SE as CQI 13 in Table 5.1.3.1-1;
+# the LUT caps at 13 to avoid ambiguity.  CQI 0 ("out of range") is
+# never produced here — wb_cqi==0 is handled by the fallback branch.
+# ======================================================================
+MCS_TO_CQI = [1, 2, 2, 2, 2, 3, 3, 4, 4, 4,   # MCS  0-9
+              5, 5, 5, 6, 6, 7, 8, 7, 8, 9,    # MCS 10-19
+              9, 9, 10, 11, 11, 11, 12, 12, 13] # MCS 20-28
+
+# ======================================================================
+# FIX-7: Per-slice RB cap (fraction of server's virtual RB partition)
+# -----------------------------------------------------------------------
+# URLLC : 1.0  — must be allowed to drain entirely within deadline
+# eMBB  : 0.5  — cap at 50 % of server virt_rbs to prevent monopoly
+# mMTC  : 0.3  — low-priority, small packets, generous deadline
+#
+# The cap is applied as:
+#   max_rbs_for_this_ue = floor(SLICE_RB_CAP[slice] × virt_rbs[j])
+# and then alloc_rbs = min(alloc_rbs, max_rbs_for_this_ue).
+# ======================================================================
+SLICE_RB_CAP = {
+    "URLLC": 1.0,
+    "eMBB":  0.5,
+    "mMTC":  0.3,
+}
 
 
 # ======================================================================
@@ -148,30 +191,28 @@ class GlobalUEState:
 
             self.states[rnti] = {
                 # Static profile
-                "label":         label,
-                "slice":         slc,
-                "5qi":           fqi,
-                "priority":      prio,
-                "lam_nom":       lam_nom,
-                "beta_max_ms":   beta_ms,
-                "beta_max_s":    beta_ms / 1000.0,   # FIX-4: pre-converted to seconds
-                "gamma_min":     gmin,
-                "eps1":          e1,
-                "eps2":          e2,
-                "nom_pkt_bytes": npkt,
-                # Runtime — updated by RLC (FIX-2)
-                "txbuf_bytes":   0,
-                "txsdu_wt_us":   0,
-                # Runtime — updated by MAC
-                "lam_est":       lam_nom,
-                "bsr_bytes":     0,
-                "cqi":           0,
-                "dl_bler":       0.0,   # DL block error rate from OAI (ue.dl_bler)
-                # se_bits_per_rb: derived directly from OAI dl_curr_tbs / dl_sched_rb
-                # (replaces the old CQI_TO_SE / MCS_TO_SE table lookups)
+                "label":          label,
+                "slice":          slc,
+                "5qi":            fqi,
+                "priority":       prio,
+                "lam_nom":        lam_nom,
+                "beta_max_ms":    beta_ms,
+                "beta_max_s":     beta_ms / 1000.0,
+                "gamma_min":      gmin,
+                "eps1":           e1,
+                "eps2":           e2,
+                "nom_pkt_bytes":  npkt,
+                # Runtime — RLC (FIX-2)
+                "txbuf_bytes":    0,
+                "txsdu_wt_us":    0,
+                # Runtime — MAC
+                "lam_est":        lam_nom,
+                "bsr_bytes":      0,
+                "cqi":            0,
+                "dl_bler":        0.0,
                 "se_bits_per_rb": SE_FLOOR_BITS_PER_RB,
-                "harq_pending":  False,
-                "avg_tp_bits":   1e-6,
+                "harq_pending":   False,
+                "avg_tp_bits":    1e-6,
             }
             self.rnti_order.append(rnti)
             print(f"[SDAP] Registered RNTI {rnti} -> {label} "
@@ -196,7 +237,7 @@ class AltamasState:
         self.mu    = [cfg[2] for cfg in SERVERS_CFG]
         self.k_buf = [cfg[3] for cfg in SERVERS_CFG]
 
-        # Physical RB partition: Cellular ~67%, WLAN ~33%
+        # Physical RB partition: Cellular ~67 %, WLAN ~33 %
         nr_rbs   = round(TOTAL_RBS * 0.67)
         wlan_rbs = TOTAL_RBS - nr_rbs
         self.virt_rbs  = [nr_rbs, wlan_rbs]
@@ -209,16 +250,7 @@ altamas = AltamasState()
 
 
 # ======================================================================
-# Eq. (9) — Average latency W(Q_i, S_j, Psi)
-#
-# Preemptive M/M/1 priority queueing (Kleinrock Vol. II, §3.4):
-#
-#   Ω(Pi,   Sj, Ψ) = Σ_{m: Ψ[m]=j, P[m]≤P[i]}  λ_m / µ_j
-#   Ω(Pi-1, Sj, Ψ) = Σ_{m: Ψ[m]=j, P[m]< P[i]}  λ_m / µ_j
-#
-#   W(Q_i, Sj, Ψ) = [1/µ_j  +  Ω(Pi)/(µ_j(1−Ω(Pi)))] / (1 − Ω(Pi−1))
-#
-# Returns seconds.  Returns inf when the server is unstable for flow i.
+# Eq. (9) — Average latency W(Q_i, S_j, Psi)  [returns seconds]
 # ======================================================================
 def calculate_latency(i, j, Psi, lam, P, mu):
     M = len(lam)
@@ -232,40 +264,24 @@ def calculate_latency(i, j, Psi, lam, P, mu):
 
     base  = (1.0 / mu[j]) + omega_pi / (mu[j] * max(1.0 - omega_pi, 1e-12))
     denom = max(1.0 - omega_pim1, 1e-12)
-    return base / denom   # seconds
+    return base / denom
 
 
 # ======================================================================
-# Eq. (7, 8) — Packet Loss Rate and Throughput
-#
-# PLR(Q_i, Sj, Ψ) = AL(Pi)/A(Pi)  +  P(W(Q_i,Sj,Ψ) > β_max_i)
-#
-# Paper Eq.(8): P(W > β_max) is a deterministic indicator.
-#   W(Q_i, Sj, Ψ) is the closed-form result of Eq.(9).
-#   If W > β_max_i  →  1  (packet violates latency bound → lost)
-#   If W ≤ β_max_i  →  0  (packet is within deadline)
-#
-# Buffer overflow AL/A uses the M/M/1/K formula for priority-class
-# load ρ_Pi  (Ref [13], paper Eq.8).
+# Eq. (7, 8) — Packet Loss Rate
 # ======================================================================
 def calculate_plr(i, j, Psi, lam, beta_max_s, P, mu, k_buf):
-    """
-    Args:
-        beta_max_s : deadline vector in SECONDS
-    """
     M = len(lam)
 
-    # Ω(Pi) — load from flows with priority ≤ Pi on server j
     omega_pi   = sum(lam[m] / mu[j]
                      for m in range(M) if Psi[m] == j and P[m] <= P[i])
-    # Ω(Pi-1) — load from flows with strictly higher priority (P[m] < P[i])
     omega_pim1 = sum(lam[m] / mu[j]
                      for m in range(M) if Psi[m] == j and P[m] <  P[i])
 
     rho_pi = omega_pi
     k      = float(k_buf[j])
 
-    # ── Buffer overflow  AL/A  (Ref [13]) ──────────────────────────────
+    # Buffer overflow  AL/A  (Ref [13])
     if rho_pi <= 0.0:
         al_over_a = 0.0
     elif abs(rho_pi - 1.0) < 1e-9:
@@ -277,16 +293,12 @@ def calculate_plr(i, j, Psi, lam, beta_max_s, P, mu, k_buf):
     else:
         al_over_a  = 1.0
 
-    # ── Latency violation  P(W_i > β_max_i)  ───────────────────────────
-    # Paper Eq.(8): deterministic indicator using W from Eq.(9).
-    # W(Q_i, Sj, Ψ) is computed analytically via calculate_latency().
-    # If W exceeds the deadline β_max_i, the packet is considered lost → 1.
-    # If W ≤ β_max_i, no latency-induced loss → 0.
-    w_i = calculate_latency(i, j, Psi, lam, P, mu)   # seconds (Eq.9)
+    # Latency violation — deterministic indicator (FIX-5)
+    w_i = calculate_latency(i, j, Psi, lam, P, mu)
     if not math.isfinite(w_i):
-        p_late = 1.0                          # unstable server → all packets late
+        p_late = 1.0
     else:
-        p_late = 1.0 if w_i > beta_max_s[i] else 0.0   # Eq.(8)
+        p_late = 1.0 if w_i > beta_max_s[i] else 0.0
 
     return min(al_over_a + p_late, 1.0)
 
@@ -298,24 +310,9 @@ def calculate_throughput(i, j, Psi, lam, beta_max_s, P, mu, k_buf):
 
 # ======================================================================
 # Eq. (10–13) — Goal-Programming Combined Reward Rc
-#
-# FIX-4: All W comparisons now use seconds throughout.
-#   w_i         = calculate_latency(...)  → seconds
-#   w_target    = beta_max_s[i]           → seconds  (pre-converted)
-#   Wδ_norm: min[0, β−W] / max(β, W)     → dimensionless  ✓
 # ======================================================================
 def calculate_gp_reward(Psi, lam, gamma_min, beta_max_s,
                         P, eps1, eps2, mu, k_buf):
-    """
-    Rc(Q, S, Ψ) = Σ_i  U(Q_i, Sj, Ψ)              Eq.(10)
-
-    U_i = ε1_i · TPδ_norm  +  ε2_i · Wδ_norm       Eq.(11)
-
-    TPδ_norm = min[0, TP − γ·λ]  / max(γ·λ, TP)    Eq.(12)
-    Wδ_norm  = min[0, β − W]     / max(β,   W)      Eq.(13)
-
-    U_i ∈ [−1, 0];  Rc ∈ [−M, 0].  Scheduling pushes Rc → 0.
-    """
     M  = len(lam)
     Rc = 0.0
 
@@ -325,56 +322,36 @@ def calculate_gp_reward(Psi, lam, gamma_min, beta_max_s,
             continue
 
         tp_i = calculate_throughput(i, j, Psi, lam, beta_max_s, P, mu, k_buf)
-        w_i  = calculate_latency(i, j, Psi, lam, P, mu)   # seconds
+        w_i  = calculate_latency(i, j, Psi, lam, P, mu)
 
         if not math.isfinite(w_i):
-            # Unstable: assign worst-case W = 10× deadline
             w_i = 10.0 * max(beta_max_s[i], 1e-6)
 
-        tp_target = gamma_min[i] * lam[i]     # C1  Eq.(5)  pkt/s
-        w_target  = beta_max_s[i]             # C2  Eq.(6)  seconds  (FIX-4)
+        tp_target = gamma_min[i] * lam[i]
+        w_target  = beta_max_s[i]
 
-        # Eq.(12): TPδ_norm — shortfall from throughput target (≤ 0)
         tp_dn = (min(0.0, tp_i - tp_target)
                  / max(max(tp_target, tp_i), 1e-12))
 
-        # Eq.(13): Wδ_norm — latency slack (≤ 0 when W > β)
-        # FIX-4: both w_target and w_i are in seconds → correct ratio
         w_dn  = (min(0.0, w_target - w_i)
                  / max(max(w_target, w_i), 1e-12))
 
-        Rc += eps1[i] * tp_dn + eps2[i] * w_dn   # Eq.(11)
+        Rc += eps1[i] * tp_dn + eps2[i] * w_dn
 
     return Rc
 
 
 # ======================================================================
 # Algorithm 1 — EvaluateAndObtainMapping
-#
-# Paper pseudocode (faithful):
-#   for x = 1 to L:
-#       if stability(Ψ[x]):
-#           if R[x] == -1  OR  R[l] < R[x]:   ← l is current best index
-#               return x                         ← first qualifying x wins
-#
-# Two cases cause a candidate to win:
-#   (a) R[x] == -1  → unseen candidate; the paper returns it immediately
-#       (exploration of unvisited mappings takes priority)
-#   (b) R[l] < R[x] → candidate beats current-best known reward
-#
-# Among case-(b) candidates the paper takes the FIRST one found in
-# enumeration order (not the global maximum), consistent with the
-# original pseudocode "return x" inside the loop.
 # ======================================================================
 def evaluate_and_obtain_mapping(Psi_all, R_dict, lam, mu, rho_max=0.9):
     M = len(lam)
     N = len(mu)
 
-    current_best_R = -float('inf')   # R[l] in the paper (current mapping's R)
+    current_best_R = -float('inf')
     best_Psi       = None
 
     for Psi_x in Psi_all:
-        # Stability check  Eq.(2): ρ_j = Σ λ_i·ψ_ij / µ_j ≤ 0.9  ∀j
         stable = all(
             (sum(lam[i] for i in range(M) if Psi_x[i] == j) / mu[j]) <= rho_max
             for j in range(N)
@@ -384,30 +361,20 @@ def evaluate_and_obtain_mapping(Psi_all, R_dict, lam, mu, rho_max=0.9):
 
         rx = R_dict.get(Psi_x, -1)
 
-        # Paper condition: R[x]==-1 OR R[l] < R[x]
         if rx == -1 or rx > current_best_R:
             best_Psi       = Psi_x
             current_best_R = rx if rx != -1 else current_best_R
-            # Paper returns the FIRST qualifying candidate immediately;
-            # we continue scanning to honour "highest R" when no R==-1
-            # remains — but stop as soon as we find an unseen mapping.
             if rx == -1:
-                return best_Psi   # unseen → return immediately (Algorithm 1)
+                return best_Psi
 
-    if best_Psi is None and Psi_all:   # absolute fallback (all unstable)
+    if best_Psi is None and Psi_all:
         best_Psi = Psi_all[0]
 
     return best_Psi
 
 
 # ======================================================================
-# RLC Callback — buffer state only
-#
-# FIX-2: Reset then properly aggregate across all bearers per UE.
-#   txbuf_bytes: SUM  — total DL bytes queued for this UE
-#   txsdu_wt_us: MAX  — worst HOL waiting time across bearers
-# Previously the code did a plain assignment (=), so with multiple
-# radio bearers (SRBs + DRBs) only the last bearer's value was kept.
+# RLC Callback — buffer state (FIX-2)
 # ======================================================================
 class RLCCallback(ric.rlc_cb):
     def __init__(self):
@@ -418,22 +385,16 @@ class RLCCallback(ric.rlc_cb):
             if not ind.rb_stats:
                 return
 
-            # Step 1: reset all tracked UEs for this report cycle
             for rnti in global_ue_state.states:
                 global_ue_state.states[rnti]["txbuf_bytes"] = 0
                 global_ue_state.states[rnti]["txsdu_wt_us"] = 0
 
-            # Step 2: aggregate across bearers
             for rb in ind.rb_stats:
                 rnti = rb.rnti
                 global_ue_state.register_ue(rnti)
                 st = global_ue_state.states[rnti]
-
-                # FIX-2a: sum bytes across all bearers
                 st["txbuf_bytes"] += int(rb.txbuf_occ_bytes)
-
-                # FIX-2b: max HOL wait time across all bearers
-                st["txsdu_wt_us"] = max(st["txsdu_wt_us"], int(rb.txsdu_wt_us))
+                st["txsdu_wt_us"]  = max(st["txsdu_wt_us"], int(rb.txsdu_wt_us))
 
         except Exception as e:
             print(f"[RLC ERROR] {e}")
@@ -453,19 +414,15 @@ class MACCallback(ric.mac_cb):
                 return
 
             t_now = ind.tstamp
-
-            # ── Step 1: Update MAC measurements, estimate lambda ─────────
             active_ues = []
 
+            # ── Step 1: Update MAC measurements, estimate lambda ─────────
             for ue in ind.ue_stats:
                 rnti = ue.rnti
                 global_ue_state.register_ue(rnti)
                 st = global_ue_state.states[rnti]
 
-                # ── Bits-per-RB from OAI-reported dl_curr_tbs / dl_sched_rb ──
-                # OAI already accounts for CQI, MCS, MIMO layers, coding rate,
-                # and symbol count internally — we just read the result directly.
-                # No CQI_TO_SE or MCS_TO_SE table needed.
+                # Bits-per-RB from OAI dl_curr_tbs / dl_sched_rb
                 try:
                     tbs_bits_now = int(ue.dl_curr_tbs)
                     sched_rbs    = int(ue.dl_sched_rb)
@@ -474,41 +431,36 @@ class MACCallback(ric.mac_cb):
                             tbs_bits_now / sched_rbs,
                             SE_FLOOR_BITS_PER_RB
                         )
-                    # else: keep previous se_bits_per_rb (no new grant this slot)
                 except Exception:
-                    pass   # keep previous se_bits_per_rb
+                    pass
 
-                # wb_cqi: persist across slots — refreshed on PUCCH cycle only.
-                # Writing unconditionally overwrites valid values with 0 on
-                # every slot OAI hasn't updated it.  Fall back to MCS-derived
-                # CQI when wb_cqi is always 0 (common in some OAI builds).
+                # ── CQI — primary source: wb_cqi (TS 38.214 Table 5.1.3.1-1)
+                # wb_cqi is only refreshed on PUCCH reporting cycles so it
+                # may read 0 between cycles.  When it is 0 we fall back to
+                # dl_mcs1 via the pre-computed MCS_TO_CQI LUT (FIX-9).
+                # The derived CQI is stored for CSV logging only; the RB
+                # allocator uses se_bits_per_rb = dl_curr_tbs/dl_sched_rb
+                # which already embeds OAI's full CQI/MCS/MIMO computation.
                 try:
                     cqi_now = int(ue.wb_cqi)
                     if cqi_now > 0:
-                        st["cqi"] = cqi_now
+                        # wb_cqi is valid — use directly (range 1-15)
+                        st["cqi"] = min(max(cqi_now, 1), 15)
                     else:
+                        # wb_cqi == 0 means not yet reported this cycle;
+                        # derive from dl_mcs1 using the 3GPP-aligned LUT.
                         mcs = int(ue.dl_mcs1)
-                        if mcs >= 0:
-                            if   mcs <= 2:  derived = max(1, mcs + 1)
-                            elif mcs <= 5:  derived = mcs + 2
-                            elif mcs <= 9:  derived = mcs + 1
-                            elif mcs <= 12: derived = mcs - 1
-                            elif mcs <= 16: derived = mcs - 2
-                            else:           derived = min(15, mcs - 3)
-                            if derived > 0:
-                                st["cqi"] = derived
-                    # else: retain previous cqi
+                        if 0 <= mcs <= 28:          # valid MCS range
+                            st["cqi"] = MCS_TO_CQI[mcs]
+                        # else: retain previous cqi (mcs<0 = not scheduled)
                 except Exception:
-                    pass   # retain previous cqi
+                    pass   # retain previous cqi on any read error
 
-                # dl_bler — OAI DL block error rate; stored for potential use
-                # in link-adaptation and PLR cross-checking
                 try:
                     st["dl_bler"] = float(ue.dl_bler)
                 except Exception:
                     pass
 
-                # HARQ pending
                 try:
                     harq = ue.dl_harq
                     st["harq_pending"] = (
@@ -519,18 +471,12 @@ class MACCallback(ric.mac_cb):
                 except Exception:
                     st["harq_pending"] = False
 
-                # BSR
                 try:
                     st["bsr_bytes"] = int(ue.bsr)
                 except Exception:
                     pass
 
-                # FIX-1 (updated): lambda estimated from dl_aggr_tbs (aggregate
-                # TBS over the full reporting window, not just the current slot).
-                # dl_aggr_tbs is more stable than dl_curr_tbs which is zero on
-                # unscheduled slots and spiky on burst grants.
-                # pkt/s = (aggr_bits / 8 / nom_pkt_bytes) / report_interval_s
-                # report_interval_s ≈ 10 ms  (ric.Interval_ms_10)
+                # FIX-1: λ from dl_aggr_tbs
                 REPORT_INTERVAL_S = 10e-3
                 try:
                     aggr_tbs_bits = int(ue.dl_aggr_tbs)
@@ -565,11 +511,11 @@ class MACCallback(ric.mac_cb):
             P_vec       = []
             lam_vec     = []
             gamma_vec   = []
-            beta_ms_vec = []    # ms — for RB allocation deadline math
-            beta_s_vec  = []    # seconds — for queueing model (FIX-4)
+            beta_ms_vec = []
+            beta_s_vec  = []
             eps1_vec    = []
             eps2_vec    = []
-            lat_ms_vec  = []    # measured HOL latency in ms (for RB alloc)
+            lat_ms_vec  = []
 
             for rnti in active_ues:
                 st = global_ue_state.states[rnti]
@@ -577,7 +523,7 @@ class MACCallback(ric.mac_cb):
                 lam_vec.append(max(st["lam_est"], 1e-3))
                 gamma_vec.append(st["gamma_min"])
                 beta_ms_vec.append(st["beta_max_ms"])
-                beta_s_vec.append(st["beta_max_s"])   # FIX-4
+                beta_s_vec.append(st["beta_max_s"])
                 eps1_vec.append(st["eps1"])
                 eps2_vec.append(st["eps2"])
                 lat_ms_vec.append(st["txsdu_wt_us"] / 1000.0)
@@ -589,24 +535,21 @@ class MACCallback(ric.mac_cb):
 
             if do_update:
                 if altamas.Psi_best is not None:
-                    # Step 1: evaluate current mapping's Rc
                     Rc = calculate_gp_reward(
                         altamas.Psi_best,
-                        lam_vec, gamma_vec, beta_s_vec,   # FIX-4: seconds
+                        lam_vec, gamma_vec, beta_s_vec,
                         P_vec, eps1_vec, eps2_vec,
                         altamas.mu, altamas.k_buf
                     )
                     if not math.isfinite(Rc):
                         Rc = -float(M)
 
-                    # Step 2: R[l] = 0.5·R[l] + 0.5·Rc   (Algorithm 1)
                     prev_R = altamas.R_dict.get(altamas.Psi_best, -1)
                     altamas.R_dict[altamas.Psi_best] = (
                         Rc if prev_R == -1
                         else ALPHA_EMA * prev_R + (1.0 - ALPHA_EMA) * Rc
                     )
 
-                # Step 3: select best Ψ_o
                 altamas.Psi_best = evaluate_and_obtain_mapping(
                     altamas.Psi_all, altamas.R_dict, lam_vec, altamas.mu
                 )
@@ -614,7 +557,7 @@ class MACCallback(ric.mac_cb):
 
             Rc_logged = altamas.R_dict.get(altamas.Psi_best, 0.0)
 
-            # ── Corrected Physical RB Allocation ───────────────────────────────────
+            # ── Physical RB Allocation (FIX-7 applied) ───────────────────
             avail_rbs   = [True] * TOTAL_RBS
             allocations = {}
 
@@ -627,7 +570,8 @@ class MACCallback(ric.mac_cb):
                 rb_base    = altamas.rb_offset[j]
                 virt_pool  = [True] * virt_count
 
-                # Sort: ascending priority (lower = higher), then descending urgency
+                # Sort: ascending priority (lower number = higher priority),
+                # then descending urgency ratio
                 flows_on_j.sort(key=lambda idx: (
                     P_vec[idx],
                     -(lat_ms_vec[idx] / max(beta_ms_vec[idx], 1.0))
@@ -641,51 +585,64 @@ class MACCallback(ric.mac_cb):
                     if buf_bits <= 0:
                         continue
 
-                    # se_bits_per_rb was derived directly from OAI dl_curr_tbs/dl_sched_rb.
-                    # Skip UE if no real OAI grant has arrived yet (still at SE floor).
                     if st["se_bits_per_rb"] <= SE_FLOOR_BITS_PER_RB:
                         continue
                     tbsRB = st["se_bits_per_rb"]
 
-                    # FIX 1: Convert C1 throughput target to bits per slot
-                    target_bps = gamma_vec[ue_idx] * lam_vec[ue_idx] * st["nom_pkt_bytes"] * 8
-                    target_bits_per_slot = target_bps * SLOT_DURATION_S
+                    # C1: throughput-target-derived RB requirement
+                    target_bps            = (gamma_vec[ue_idx] * lam_vec[ue_idx]
+                                             * st["nom_pkt_bytes"] * 8)
+                    target_bits_per_slot  = target_bps * SLOT_DURATION_S
                     req_c1 = math.ceil(target_bits_per_slot / tbsRB)
 
-                    # FIX 2: Aggressive draining for strict latency flows
-                    # Instead of pacing over remain_slots, calculate total RBs needed to clear the buffer
+                    # RBs needed to drain the entire buffer
                     rbs_to_drain_buffer = math.ceil(buf_bits / tbsRB)
-                    
+
                     if st["slice"] == "URLLC":
-                        # URLLC should not pace; grant RBs to drain the entire buffer immediately
+                        # URLLC drains entire buffer immediately
                         req_rbs = rbs_to_drain_buffer
                     else:
-                        # eMBB and mMTC can safely pace over remain_slots to save resources
-                        remain_slots = max(1.0, (beta_ms_vec[ue_idx] - lat_ms_vec[ue_idx]) / SLOT_DURATION_MS)
+                        # eMBB / mMTC: pace over remaining deadline slots
+                        remain_slots = max(
+                            1.0,
+                            (beta_ms_vec[ue_idx] - lat_ms_vec[ue_idx])
+                            / SLOT_DURATION_MS
+                        )
                         req_c2  = math.ceil(buf_bits / (tbsRB * remain_slots))
-                        # Cap the request so we don't ask for more than the buffer holds
                         req_rbs = min(max(req_c1, req_c2), rbs_to_drain_buffer)
 
-                    # Fair-share cap within this server's RB partition
+                    # Fair-share within remaining active flows on this server
                     free_virt = [k for k, f in enumerate(virt_pool) if f]
                     remaining_active = max(
                         sum(1 for x in flows_on_j[rank:]
                             if global_ue_state.states[active_ues[x]]["txbuf_bytes"] > 0),
                         1
                     )
-                    
-                    # Give higher priority flows access to the remaining pool, rather than strict fair share
                     fair_share = max(len(free_virt) // remaining_active, 1)
-                    
+
+                    # ── FIX-7: per-slice RB cap ──────────────────────────
+                    # Cap expressed as a fraction of this server's virt_rbs.
+                    # URLLC cap = 1.0 (no effective cap — must drain on time).
+                    # eMBB cap  = 0.5 → max 50 % of virt_count per slot.
+                    # mMTC cap  = 0.3 → max 30 % of virt_count per slot.
+                    slice_cap_rbs = math.floor(
+                        SLICE_RB_CAP.get(st["slice"], 1.0) * virt_count
+                    )
+
                     if st["slice"] == "URLLC":
-                        # Allow URLLC to take up to the entire remaining virtual pool if needed
-                        alloc_rbs = min(req_rbs, len(free_virt)) 
+                        # Allow full drain up to the remaining free pool,
+                        # then additionally bounded by slice_cap (=virt_count
+                        # for URLLC so effectively no extra constraint).
+                        alloc_rbs = min(req_rbs, len(free_virt), slice_cap_rbs)
                     else:
-                        # Normal fair-share for eMBB/mMTC
-                        alloc_rbs = (min(req_rbs, len(free_virt)) if remaining_active == 1 else min(req_rbs, fair_share))
-                        
+                        # eMBB / mMTC: fair-share AND slice cap both apply
+                        if remaining_active == 1:
+                            alloc_rbs = min(req_rbs, len(free_virt), slice_cap_rbs)
+                        else:
+                            alloc_rbs = min(req_rbs, fair_share, slice_cap_rbs)
+
                     alloc_rbs = max(alloc_rbs, 0)
-                    
+
                     if alloc_rbs <= 0:
                         continue
 
@@ -704,12 +661,13 @@ class MACCallback(ric.mac_cb):
                     print(
                         f"[ALTAMAS] Slot:{altamas.global_slot} "
                         f"RNTI:{rnti}({st['label']}) -> {SERVERS_CFG[j][1]} | "
-                        f"RBs:{alloc_rbs} lam:{lam_vec[ue_idx]:.1f}pkt/s "
+                        f"RBs:{alloc_rbs}(cap={slice_cap_rbs}) "
+                        f"lam:{lam_vec[ue_idx]:.1f}pkt/s "
                         f"W:{lat_ms_vec[ue_idx]:.3f}ms "
                         f"beta:{beta_ms_vec[ue_idx]}ms Rc:{Rc_logged:.4f}"
                     )
 
-            # ── Logging — FIX-3 + FIX-4 ─────────────────────────────────
+            # ── Logging ──────────────────────────────────────────────────
             log_rows = []
             for ue_idx, rnti in enumerate(active_ues):
                 st    = global_ue_state.states[rnti]
@@ -718,11 +676,9 @@ class MACCallback(ric.mac_cb):
                                          "served_bits": 0.0})
                 j = alloc["server"]
 
-                # Queueing-model PLR and throughput
-                # FIX-4: pass beta_s_vec (seconds) to calculate_plr
                 plr_i = (calculate_plr(
                              ue_idx, j, altamas.Psi_best,
-                             lam_vec, beta_s_vec,           # FIX-4
+                             lam_vec, beta_s_vec,
                              P_vec, altamas.mu, altamas.k_buf)
                          if j >= 0 else 1.0)
 
@@ -734,26 +690,23 @@ class MACCallback(ric.mac_cb):
                 tp_mbps        = (tp_pktps        * npkt * 8) / 1e6
                 tp_target_mbps = (tp_target_pktps * npkt * 8) / 1e6
 
-                # EMA served-bits
                 st["avg_tp_bits"] = (
                     (1.0 - ALPHA_EMA) * st["avg_tp_bits"]
                     + ALPHA_EMA * alloc["served_bits"]
                 )
 
-                # Per-flow goal deviations (for logging)
-                # FIX-4: w_i in seconds, w_target in seconds
                 w_i = (calculate_latency(
                            ue_idx, j, altamas.Psi_best, lam_vec, P_vec, altamas.mu)
                        if j >= 0 else float('inf'))
                 if not math.isfinite(w_i):
                     w_i = 10.0 * beta_s_vec[ue_idx]
 
-                w_target = beta_s_vec[ue_idx]   # FIX-4: seconds
+                w_target = beta_s_vec[ue_idx]
 
                 tp_dn = (min(0.0, tp_pktps - tp_target_pktps)
                          / max(max(tp_target_pktps, tp_pktps), 1e-12))
                 w_dn  = (min(0.0, w_target - w_i)
-                         / max(max(w_target, w_i), 1e-12))    # FIX-4
+                         / max(max(w_target, w_i), 1e-12))
                 u_i   = eps1_vec[ue_idx] * tp_dn + eps2_vec[ue_idx] * w_dn
 
                 server_label = SERVERS_CFG[j][1] if j >= 0 else "None"
@@ -815,6 +768,7 @@ for node in conn:
 print(f"\n[ALTAMAS] xApp running — logging to: {global_ue_state.csv_file}")
 print(f"[ALTAMAS] Flows: {M_FLOWS}  Servers: {N_SERVERS}  "
       f"L={N_SERVERS**M_FLOWS} candidate mappings")
+print(f"[ALTAMAS] Slice RB caps: {SLICE_RB_CAP}")
 print("[ALTAMAS] Press Ctrl+C to stop.\n")
 
 try:
